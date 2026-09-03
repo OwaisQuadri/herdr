@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=8
+// HERDR_INTEGRATION_VERSION=9
 // @ts-nocheck
 
 import net from "node:net";
@@ -178,23 +178,31 @@ export default function (pi) {
   }
 
   let agentActive = false;
+  let busyActive = false;
+  let busyUpdateSequence = 0;
+  let pendingBusyActive: boolean | undefined;
   let blockedCount = 0;
   let blockedMessage: string | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
+  let isSessionStarting = false;
+  let sessionGeneration = 0;
 
   function desiredState() {
     if (blockedCount > 0) {
       return { state: "blocked" as const, message: blockedMessage };
     }
-    if (agentActive) {
+    if (agentActive || busyActive) {
       return { state: "working" as const, message: undefined };
     }
     return { state: "idle" as const, message: undefined };
   }
 
   function publishState(force = false) {
+    if (isSessionStarting) {
+      return;
+    }
     const next = desiredState();
     if (!force && next.state === lastState && next.message === lastMessage) {
       return;
@@ -222,18 +230,60 @@ export default function (pi) {
     publishState();
   });
 
+  pi.events.on("herdr:busy", (data) => {
+    if (typeof data?.active !== "boolean") {
+      return;
+    }
+    if (!rootSession) {
+      pendingBusyActive = data.active;
+      return;
+    }
+
+    const updateSequence = ++busyUpdateSequence;
+    busyActive = data.active;
+    if (busyActive) {
+      publishState();
+      return;
+    }
+    queueMicrotask(() => {
+      if (updateSequence === busyUpdateSequence) publishState();
+    });
+  });
+
   pi.on("session_start", async (event, ctx) => {
     // TUI only: RPC/JSON/print modes are headless (no PTY herdr can display),
     // and RPC still reports hasUI=true, so mode is the reliable gate.
     if (ctx?.mode !== "tui") {
       return;
     }
+    const generation = ++sessionGeneration;
     rootSession = true;
+    isSessionStarting = true;
+    busyUpdateSequence += 1;
+    busyActive = pendingBusyActive ?? false;
+    pendingBusyActive = undefined;
+    blockedCount = 0;
+    blockedMessage = undefined;
     updateSessionRef(ctx);
     await reportSession(event?.reason);
+    if (!rootSession || generation !== sessionGeneration) {
+      return;
+    }
+    isSessionStarting = false;
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
     publishState(true);
+  });
+
+  pi.on("session_shutdown", () => {
+    rootSession = false;
+    isSessionStarting = false;
+    sessionGeneration += 1;
+    busyUpdateSequence += 1;
+    busyActive = false;
+    pendingBusyActive = undefined;
+    blockedCount = 0;
+    blockedMessage = undefined;
   });
 
   pi.on("agent_start", (_event, ctx) => {
