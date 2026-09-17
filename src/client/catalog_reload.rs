@@ -42,7 +42,11 @@ pub(super) fn apply_profiles(
         .as_ref()
         .map(|shell| shell.surface_size(state.reported_size.0, state.reported_size.1));
     let retired = supervisors.reconcile_profiles(&profiles, now);
-    let active_removed = retired.contains(endpoints.active_id());
+    let active_removed = matches!(endpoints.active_id(), endpoint::ClientEndpointId::Ssh(_))
+        && !profiles.iter().any(|profile| {
+            profile.enabled
+                && endpoint::ClientEndpointId::Ssh(profile.id.clone()) == *endpoints.active_id()
+        });
     for endpoint_id in retired {
         endpoints.disconnect(&endpoint_id);
         let cancelled = commands.disconnect(&endpoint_id);
@@ -151,7 +155,7 @@ mod tests {
                     .shell
                     .as_ref()
                     .unwrap()
-                    .endpoint_label(&ClientEndpointId::Ssh(profile.id.clone())),
+                    .endpoint_label(&endpoint::ClientEndpointId::Ssh(profile.id.clone())),
                 label
             );
         }

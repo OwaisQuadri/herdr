@@ -118,6 +118,7 @@ impl EndpointSupervisors {
                     && profile.enabled
                     && profile.target == previous.target
                     && profile.session == previous.session
+                    && profile.keybindings == previous.keybindings
             });
             if !keep {
                 retired.push(endpoint_id.clone());
@@ -151,6 +152,11 @@ impl EndpointSupervisors {
             self.next_generation = self.next_generation.saturating_add(1);
             let endpoint_id = endpoint_id.clone();
             let target = state.target.clone();
+            let mut options = options;
+            if let ConnectTarget::Ssh(profile) = &target {
+                options.endpoint_keybindings =
+                    profile.keybindings == crate::remote::RemoteKeybindings::Server;
+            }
             let event_tx = event_tx.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
@@ -280,7 +286,11 @@ fn connect_once(
         ConnectTarget::Ssh(profile) => {
             let connected = crate::remote::connect_saved_ssh(profile.id.as_str(), &profile.target, &profile.session).map_err(|error| {
                 if failure_needs_attention(&error) {
-                    std::io::Error::new(error.kind(), format!("{error}. Run `{}` interactively to approve setup, then restart this client", crate::remote::saved_ssh_bootstrap_command(&profile.target, &profile.session)))
+                    std::io::Error::new(error.kind(), format!("{error}. Run `{}` interactively to approve setup, then restart this client", crate::remote::saved_ssh_bootstrap_command(
+                        &profile.target,
+                        &profile.session,
+                        profile.keybindings,
+                    )))
                 } else { error }
             })?;
             (connected.stream, Box::new(connected.bridge))
@@ -373,6 +383,7 @@ mod tests {
             target: "build".into(),
             session: "agents".into(),
             enabled: true,
+            keybindings: crate::remote::RemoteKeybindings::Local,
         }
     }
 
@@ -437,7 +448,7 @@ mod tests {
         let mut supervisors = EndpointSupervisors::new(&[changed.clone(), other.clone()], now);
         supervisors.endpoints.get_mut(&id).unwrap().generation = Some(2);
         supervisors.endpoints.get_mut(&other_id).unwrap().generation = Some(3);
-        changed.session = "another-session".into();
+        changed.keybindings = crate::remote::RemoteKeybindings::Server;
         assert_eq!(
             supervisors.reconcile_profiles(&[changed, other], now),
             vec![id.clone()]

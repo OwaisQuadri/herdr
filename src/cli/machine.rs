@@ -6,6 +6,7 @@ const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine add <ssh-target> --label <label> [--remote-session <name>]
   herdr machine rename <profile-id> --label <label>
+  herdr machine keybindings <profile-id> <local|server>
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
@@ -14,7 +15,7 @@ Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
-Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
+Saved machines contain only a label, SSH target, explicit Herdr session, enabled state, and keybinding preference.
 SSH credentials and key material remain owned by OpenSSH.";
 
 #[derive(Serialize)]
@@ -24,6 +25,7 @@ struct MachineListRow<'a> {
     target: &'a str,
     session: &'a str,
     enabled: bool,
+    keybindings: crate::remote::RemoteKeybindings,
     selected: bool,
 }
 
@@ -32,6 +34,7 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
         Some("list") => list(&args[1..]),
         Some("add") => add(&args[1..]),
         Some("rename") => rename(&args[1..]),
+        Some("keybindings") => set_keybindings(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
         Some("disable") => set_enabled(&args[1..], false),
@@ -65,6 +68,7 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             target: &profile.target,
             session: &profile.session,
             enabled: profile.enabled,
+            keybindings: profile.keybindings,
             selected: catalog.selected_profile.as_ref() == Some(&profile.id),
         })
         .collect::<Vec<_>>();
@@ -226,6 +230,38 @@ fn rename(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
+fn set_keybindings(args: &[String]) -> std::io::Result<i32> {
+    let [raw_id, mode] = args else {
+        eprintln!("usage: herdr machine keybindings <profile-id> <local|server>");
+        return Ok(2);
+    };
+    let id = match ProfileId::parse(raw_id.clone()) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
+    let keybindings = match crate::remote::RemoteKeybindings::parse(mode) {
+        Ok(keybindings) => keybindings,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
+    let mut catalog = load_catalog()?;
+    if !catalog.set_keybindings(&id, keybindings) {
+        eprintln!("machine profile {id} was not found");
+        return Ok(1);
+    }
+    store_catalog(&catalog)?;
+    println!(
+        "Set SSH machine {id} keybindings to {}.",
+        keybindings.as_str()
+    );
+    Ok(0)
+}
+
 fn remove(args: &[String]) -> std::io::Result<i32> {
     let Some(id) = one_profile_id(args, "usage: herdr machine remove <profile-id>")? else {
         return Ok(2);
@@ -366,16 +402,34 @@ mod tests {
 
     #[test]
     fn list_rows_do_not_have_credential_fields() {
-        let encoded = serde_json::to_string(&MachineListRow {
+        let encoded = serde_json::to_value(MachineListRow {
             id: "0123456789abcdef0123456789abcdef",
             label: "Build",
             target: "dev@build",
             session: "agents",
             enabled: true,
+            keybindings: crate::remote::RemoteKeybindings::Local,
             selected: false,
         })
         .unwrap();
-        assert!(!encoded.contains("password"));
-        assert!(!encoded.contains("key"));
+        let mut keys = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "enabled",
+                "id",
+                "keybindings",
+                "label",
+                "selected",
+                "session",
+                "target",
+            ]
+        );
     }
 }

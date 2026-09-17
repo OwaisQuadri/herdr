@@ -12,6 +12,7 @@ pub(crate) struct ClientEndpointAgentViewProjection {
 pub(crate) struct ClientShellEndpoint {
     pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) label: String,
+    pub(crate) keybindings: crate::remote::RemoteKeybindings,
     pub(crate) status: ClientEndpointStatus,
     pub(crate) snapshot: Option<Box<ClientShellSnapshot>>,
     /// Connection generation that produced `snapshot`. `None` is reserved for local tests.
@@ -59,6 +60,7 @@ impl ClientShellState {
             next.push(ClientShellEndpoint {
                 endpoint_id,
                 label: profile.label.clone(),
+                keybindings: profile.keybindings,
                 status: previous.map_or(
                     if profile.enabled {
                         ClientEndpointStatus::Connecting
@@ -99,6 +101,11 @@ impl ClientShellState {
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
+        self.config.reset_to_local_keybindings();
+        self.set_local_config_diagnostic(
+            self.config
+                .local_config_diagnostic(&self.config.local_config_diagnostics),
+        );
         self.reset_endpoint_projection();
         self.active_endpoint_id = ClientEndpointId::Local;
         self.mode = ClientShellMode::Terminal;
@@ -209,8 +216,21 @@ impl ClientShellState {
             return false;
         };
         let generation = endpoint.snapshot_generation;
+        let keybindings = endpoint.keybindings;
         let switching_endpoint = endpoint_id != &self.active_endpoint_id;
         let agent_scroll = self.agent_scroll;
+        if let Err(error) = self.config.apply_keybinding_preference(
+            keybindings,
+            snapshot.server_keybindings_toml.as_deref(),
+            &snapshot.commands,
+        ) {
+            self.set_endpoint_error(error);
+            return false;
+        }
+        self.set_local_config_diagnostic(
+            self.config
+                .local_config_diagnostic(&self.config.local_config_diagnostics),
+        );
         if switching_endpoint {
             self.active_endpoint_id = endpoint_id.clone();
             self.pane_surface = None;
@@ -690,6 +710,7 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
     ClientShellEndpoint {
         endpoint_id: ClientEndpointId::Local,
         label: "Local".into(),
+        keybindings: crate::remote::RemoteKeybindings::Local,
         status: ClientEndpointStatus::Online,
         snapshot: None,
         snapshot_generation: None,
