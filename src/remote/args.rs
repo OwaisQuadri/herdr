@@ -1,14 +1,16 @@
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum RemoteKeybindings {
+    #[default]
     Local,
     Server,
 }
 
 impl RemoteKeybindings {
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "local" => Ok(Self::Local),
             "server" => Ok(Self::Server),
@@ -16,7 +18,7 @@ impl RemoteKeybindings {
         }
     }
 
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Server => "server",

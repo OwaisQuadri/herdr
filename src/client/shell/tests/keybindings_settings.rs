@@ -360,10 +360,12 @@ new_tab = "prefix+n"
 "#,
     )
     .unwrap();
-    let mut state = ClientShellState::new(
-        ClientShellConfig::from_config(&local)
-            .with_keybinding_source(ClientShellKeybindingSource::Endpoint),
-    );
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&local));
+    let mut remote = SavedSshEndpoint::new("Build", "build", "agents").unwrap();
+    remote.keybindings = crate::remote::RemoteKeybindings::Server;
+    let remote_id = ClientEndpointId::Ssh(remote.id.clone());
+    state.set_endpoint_catalog(&[remote]);
+    state.set_endpoint_status(&remote_id, ClientEndpointStatus::Online);
     let mut projection = snapshot();
     projection.server_keybindings_toml = endpoint.local_keybindings_profile_toml().ok();
     projection
@@ -375,7 +377,8 @@ new_tab = "prefix+n"
             action: crate::protocol::ClientShellCommandAction::Shell,
             description: Some("remote command".into()),
         });
-    state.set_snapshot(Box::new(projection));
+    state.set_endpoint_snapshot(&remote_id, Box::new(projection));
+    assert!(state.activate_endpoint_projection(&remote_id));
 
     assert_eq!(state.config.keybinds.prefix.0, KeyCode::Char('x'));
     assert_eq!(
@@ -396,6 +399,20 @@ new_tab = "prefix+n"
         state.config.keybinds.keybinds.custom_commands[0].command,
         "cmd_remote"
     );
+    let mut command_outcome = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Command(
+            state.config.keybinds.keybinds.custom_commands[0].clone(),
+        ),
+        &mut command_outcome,
+    );
+    let [ClientShellAction::Endpoint { request, .. }] = &command_outcome.actions[..] else {
+        panic!("expected saved-machine endpoint command binding");
+    };
+    let crate::api::schema::Method::CommandInvoke(params) = &request.method else {
+        panic!("expected command invocation");
+    };
+    assert_eq!(params.command_id, "cmd_remote");
 }
 
 #[test]
@@ -825,4 +842,72 @@ fn resize_mode_reuses_endpoint_resize_and_stays_active_until_done() {
 
     assert!(state.handle_input_bytes(b"\r").actions.is_empty());
     assert_eq!(state.mode, ClientShellMode::Terminal);
+}
+
+#[test]
+fn failed_saved_server_keybinding_transition_keeps_the_active_local_keymap() {
+    let local: Config = toml::from_str(
+        r#"
+[keys]
+prefix = "ctrl+a"
+"#,
+    )
+    .unwrap();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&local));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut remote = SavedSshEndpoint::new("Build", "build", "agents").unwrap();
+    remote.keybindings = crate::remote::RemoteKeybindings::Server;
+    let remote_id = ClientEndpointId::Ssh(remote.id.clone());
+    state.set_endpoint_catalog(&[remote]);
+    state.set_endpoint_status(&remote_id, ClientEndpointStatus::Online);
+    state.set_endpoint_snapshot(&remote_id, Box::new(snapshot()));
+
+    assert!(!state.activate_endpoint_projection(&remote_id));
+    assert!(state.endpoint_is_active(&ClientEndpointId::Local));
+    assert_eq!(state.config.keybinds.prefix.0, KeyCode::Char('a'));
+    assert_eq!(
+        state.config.keybinding_source,
+        ClientShellKeybindingSource::Local
+    );
+}
+
+#[test]
+fn server_keybindings_refresh_stored_local_keys_on_live_reload() {
+    let local: Config = toml::from_str(
+        r#"
+[keys]
+prefix = "ctrl+a"
+"#,
+    )
+    .unwrap();
+    let endpoint: Config = toml::from_str(
+        r#"
+[keys]
+prefix = "ctrl+x"
+"#,
+    )
+    .unwrap();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&local));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut remote = SavedSshEndpoint::new("Build", "build", "agents").unwrap();
+    remote.keybindings = crate::remote::RemoteKeybindings::Server;
+    let remote_id = ClientEndpointId::Ssh(remote.id.clone());
+    state.set_endpoint_catalog(&[remote]);
+    state.set_endpoint_status(&remote_id, ClientEndpointStatus::Online);
+    let mut remote_snapshot = snapshot();
+    remote_snapshot.server_keybindings_toml = endpoint.local_keybindings_profile_toml().ok();
+    state.set_endpoint_snapshot(&remote_id, Box::new(remote_snapshot));
+    assert!(state.activate_endpoint_projection(&remote_id));
+
+    let reloaded: Config = toml::from_str(
+        r#"
+[keys]
+prefix = "ctrl+z"
+"#,
+    )
+    .unwrap();
+    state.config.apply_live_config(&reloaded, &[], &[]);
+
+    assert_eq!(state.config.keybinds.prefix.0, KeyCode::Char('x'));
+    assert_eq!(state.config.local_keys.prefix, reloaded.keys.prefix);
 }

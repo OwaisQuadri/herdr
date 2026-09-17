@@ -50,6 +50,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences_path: Option<std::path::PathBuf>,
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
+    pub(super) local_config_diagnostics: Vec<String>,
     pub(super) startup_onboarding: bool,
 }
 

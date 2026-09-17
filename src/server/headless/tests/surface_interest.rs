@@ -565,7 +565,9 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         target: "dev@example.com".into(),
         session: "main".into(),
         enabled: true,
+        keybindings: crate::remote::RemoteKeybindings::Server,
     };
+    assert!(remote_snapshot.server_keybindings_toml.is_some());
     let target_id = ClientEndpointId::Ssh(profile.id.clone());
     let mut shell = crate::client::ClientShellState::new(
         crate::client::ClientShellConfig::from_config(&crate::config::Config::default()),

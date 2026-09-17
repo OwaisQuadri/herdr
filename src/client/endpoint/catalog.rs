@@ -9,6 +9,7 @@ use super::ProfileId;
 
 const CATALOG_VERSION: u32 = 1;
 const SELECTION_VERSION: u32 = 1;
+const KEYBINDING_PREFERENCES_VERSION: u32 = 1;
 const MAX_CATALOG_BYTES: u64 = 64 * 1024;
 const MAX_PROFILES: usize = 64;
 const MAX_LABEL_BYTES: usize = 128;
@@ -23,6 +24,8 @@ pub(crate) struct SavedSshEndpoint {
     pub(crate) target: String,
     pub(crate) session: String,
     pub(crate) enabled: bool,
+    #[serde(skip)]
+    pub(crate) keybindings: crate::remote::RemoteKeybindings,
 }
 
 impl SavedSshEndpoint {
@@ -37,6 +40,7 @@ impl SavedSshEndpoint {
             target: target.into(),
             session: session.into(),
             enabled: true,
+            keybindings: crate::remote::RemoteKeybindings::Local,
         };
         profile.validate()?;
         Ok(profile)
@@ -88,6 +92,14 @@ struct EndpointSelection {
     selected_profile: Option<ProfileId>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointKeybindingPreferences {
+    version: u32,
+    #[serde(default)]
+    server_profiles: Vec<ProfileId>,
+}
+
 impl Default for EndpointCatalog {
     fn default() -> Self {
         Self {
@@ -100,16 +112,25 @@ impl Default for EndpointCatalog {
 
 impl EndpointCatalog {
     pub(crate) fn load() -> Result<Self, String> {
-        Self::load_from_paths(&catalog_path(), &selection_path())
+        Self::load_from_paths(
+            &catalog_path(),
+            &selection_path(),
+            &keybinding_preferences_path(),
+        )
     }
 
     pub(crate) fn load_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
-        // Live clients keep their own selection, independent of other attached clients.
-        Self::load_from_path(&catalog_path()).map(|catalog| catalog.ssh)
+        Self::load_with_keybinding_preferences(&catalog_path(), &keybinding_preferences_path())
+            .map(|catalog| catalog.ssh)
     }
 
-    fn load_from_paths(catalog_path: &Path, selection_path: &Path) -> Result<Self, String> {
-        let mut catalog = Self::load_from_path(catalog_path)?;
+    fn load_from_paths(
+        catalog_path: &Path,
+        selection_path: &Path,
+        keybinding_preferences_path: &Path,
+    ) -> Result<Self, String> {
+        let mut catalog =
+            Self::load_with_keybinding_preferences(catalog_path, keybinding_preferences_path)?;
         match load_selection_from_path(selection_path) {
             Ok(Some(selection)) => {
                 let valid = selection.selected_profile.as_ref().is_none_or(|selected| {
@@ -140,7 +161,51 @@ impl EndpointCatalog {
     }
 
     pub(crate) fn store_profiles(&self) -> Result<(), String> {
-        self.store_to_path(&catalog_path())
+        self.store_to_path(&catalog_path())?;
+        self.store_keybinding_preferences_to_path(&keybinding_preferences_path())
+    }
+
+    fn load_with_keybinding_preferences(
+        catalog_path: &Path,
+        keybinding_preferences_path: &Path,
+    ) -> Result<Self, String> {
+        let mut catalog = Self::load_from_path(catalog_path)?;
+        match load_keybinding_preferences_from_path(keybinding_preferences_path) {
+            Ok(Some(preferences)) => {
+                for profile in &mut catalog.ssh {
+                    profile.keybindings = if preferences.server_profiles.contains(&profile.id) {
+                        crate::remote::RemoteKeybindings::Server
+                    } else {
+                        crate::remote::RemoteKeybindings::Local
+                    };
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %keybinding_preferences_path.display(),
+                    "saved endpoint keybinding preferences are unavailable; using Local"
+                );
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn store_keybinding_preferences_to_path(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        let server_profiles = self
+            .ssh
+            .iter()
+            .filter(|profile| profile.keybindings == crate::remote::RemoteKeybindings::Server)
+            .map(|profile| profile.id.clone())
+            .collect();
+        let content = serde_json::to_vec_pretty(&EndpointKeybindingPreferences {
+            version: KEYBINDING_PREFERENCES_VERSION,
+            server_profiles,
+        })
+        .map_err(|error| format!("failed to encode endpoint keybinding preferences: {error}"))?;
+        store_private_json(path, &content, "endpoint keybinding preferences")
     }
 
     pub(crate) fn store_selection(&self) -> Result<(), String> {
@@ -243,6 +308,18 @@ impl EndpointCatalog {
         true
     }
 
+    pub(crate) fn set_keybindings(
+        &mut self,
+        id: &ProfileId,
+        keybindings: crate::remote::RemoteKeybindings,
+    ) -> bool {
+        let Some(profile) = self.ssh.iter_mut().find(|profile| &profile.id == id) else {
+            return false;
+        };
+        profile.keybindings = keybindings;
+        true
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.version != CATALOG_VERSION {
             return Err(format!(
@@ -309,6 +386,32 @@ impl EndpointCatalog {
             .map_err(|error| format!("failed to encode endpoint catalog: {error}"))?;
         store_private_json(path, &content, "endpoint catalog")
     }
+}
+
+fn load_keybinding_preferences_from_path(
+    path: &Path,
+) -> Result<Option<EndpointKeybindingPreferences>, String> {
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read endpoint keybinding preferences: {error}"
+            ))
+        }
+    };
+    if content.len() as u64 > MAX_CATALOG_BYTES {
+        return Err("endpoint keybinding preferences exceed the storage limit".into());
+    }
+    let preferences: EndpointKeybindingPreferences = serde_json::from_slice(&content)
+        .map_err(|error| format!("stored endpoint keybinding preferences are invalid: {error}"))?;
+    if preferences.version != KEYBINDING_PREFERENCES_VERSION {
+        return Err(format!(
+            "unsupported endpoint keybinding preferences version {}; expected {KEYBINDING_PREFERENCES_VERSION}",
+            preferences.version
+        ));
+    }
+    Ok(Some(preferences))
 }
 
 fn load_selection_from_path(path: &Path) -> Result<Option<EndpointSelection>, String> {
@@ -378,6 +481,12 @@ fn selection_path() -> PathBuf {
         .join("endpoint-selection.json")
 }
 
+fn keybinding_preferences_path() -> PathBuf {
+    crate::config::state_dir()
+        .join("client")
+        .join("endpoint-keybindings.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +498,26 @@ mod tests {
                 std::process::id()
             ))
             .join("endpoints.json")
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Released090Catalog {
+        version: u32,
+        #[serde(default)]
+        selected_profile: Option<ProfileId>,
+        #[serde(default)]
+        ssh: Vec<Released090Profile>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Released090Profile {
+        id: ProfileId,
+        label: String,
+        target: String,
+        session: String,
+        enabled: bool,
     }
 
     #[test]
@@ -404,11 +533,70 @@ mod tests {
 
         let encoded = std::fs::read_to_string(&path).unwrap();
         assert!(!encoded.contains("password"));
-        assert!(!encoded.contains("private_key"));
+        assert!(!encoded.contains("key"));
         assert!(!encoded.contains("control_socket"));
         let loaded = EndpointCatalog::load_from_path(&path).unwrap();
         assert_eq!(loaded, catalog);
         assert_eq!(loaded.ssh[0].id, id);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn old_profiles_default_to_local_keybindings() {
+        let path = path("old-keybindings");
+        let preferences_path = path.with_file_name("keybindings.json");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "ssh": [{
+                "id": "0123456789abcdef0123456789abcdef",
+                "label": "Build",
+                "target": "build",
+                "session": "default",
+                "enabled": true
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let mut catalog =
+            EndpointCatalog::load_with_keybinding_preferences(&path, &preferences_path).unwrap();
+        assert_eq!(
+            catalog.ssh[0].keybindings,
+            crate::remote::RemoteKeybindings::Local
+        );
+        let id = catalog.ssh[0].id.clone();
+        catalog.store_to_path(&path).unwrap();
+        catalog
+            .store_keybinding_preferences_to_path(&preferences_path)
+            .unwrap();
+        let local_profile = std::fs::read(&path).unwrap();
+        let old_local: Released090Catalog = serde_json::from_slice(&local_profile).unwrap();
+        assert_eq!(old_local.version, CATALOG_VERSION);
+        assert_eq!(old_local.selected_profile, None);
+        assert_eq!(old_local.ssh.len(), 1);
+        assert_eq!(old_local.ssh[0].label, "Build");
+        assert_eq!(old_local.ssh[0].id, id);
+        assert_eq!(old_local.ssh[0].target, "build");
+        assert_eq!(old_local.ssh[0].session, "default");
+        assert!(old_local.ssh[0].enabled);
+
+        assert!(catalog.set_keybindings(&id, crate::remote::RemoteKeybindings::Server));
+        catalog.store_to_path(&path).unwrap();
+        catalog
+            .store_keybinding_preferences_to_path(&preferences_path)
+            .unwrap();
+        let server_profile = std::fs::read(&path).unwrap();
+        let old_server: Released090Catalog = serde_json::from_slice(&server_profile).unwrap();
+        assert_eq!(old_server.version, CATALOG_VERSION);
+        assert_eq!(old_server.ssh.len(), 1);
+        assert!(old_server.ssh[0].enabled);
+        assert!(std::fs::read_to_string(&preferences_path)
+            .unwrap()
+            .contains("server_profiles"));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -534,7 +722,12 @@ mod tests {
         catalog.store_to_path(&catalog_path).unwrap();
         std::fs::write(&selection_path, b"not json").unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &selection_path,
+            &catalog_path.with_file_name("keybindings.json"),
+        )
+        .unwrap();
         assert_eq!(loaded.ssh.len(), 1);
         assert_eq!(loaded.ssh[0].id, id);
         assert_eq!(loaded.selected_profile, None);
@@ -561,7 +754,12 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &selection_path,
+            &catalog_path.with_file_name("keybindings.json"),
+        )
+        .unwrap();
         assert_eq!(loaded.ssh[0].id, saved);
         assert_eq!(loaded.selected_profile, None);
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();

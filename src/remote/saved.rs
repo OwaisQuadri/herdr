@@ -72,11 +72,20 @@ impl SavedSshApiBridge {
     }
 }
 
-pub(crate) fn saved_ssh_bootstrap_command(target: &str, session: &str) -> String {
+pub(crate) fn saved_ssh_bootstrap_command(
+    target: &str,
+    session: &str,
+    keybindings: crate::remote::RemoteKeybindings,
+) -> String {
     format!(
-        "herdr --remote {} --session {}",
+        "herdr --remote {} --session {}{}",
         super::shell_quote(target),
-        super::shell_quote(session)
+        super::shell_quote(session),
+        if keybindings == crate::remote::RemoteKeybindings::Server {
+            " --remote-keybindings server"
+        } else {
+            ""
+        },
     )
 }
 
@@ -152,8 +161,20 @@ mod tests {
     #[test]
     fn bootstrap_command_preserves_the_explicit_remote_session() {
         assert_eq!(
-            saved_ssh_bootstrap_command("build host", "agent work"),
+            saved_ssh_bootstrap_command(
+                "build host",
+                "agent work",
+                crate::remote::RemoteKeybindings::Local,
+            ),
             "herdr --remote 'build host' --session 'agent work'"
+        );
+        assert_eq!(
+            saved_ssh_bootstrap_command(
+                "build host",
+                "agent work",
+                crate::remote::RemoteKeybindings::Server,
+            ),
+            "herdr --remote 'build host' --session 'agent work' --remote-keybindings server"
         );
     }
 

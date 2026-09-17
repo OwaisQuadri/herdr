@@ -89,6 +89,7 @@ impl ClientShellState {
                 if self.agent_panel_sort_manual {
                     self.config.agent_panel_sort = agent_panel_sort;
                 }
+                self.config.local_config_diagnostics = diagnostics.clone();
                 self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
                 if let Some(snapshot) = self.snapshot.as_deref() {
                     let profile = snapshot.server_keybindings_toml.clone();
@@ -102,6 +103,7 @@ impl ClientShellState {
                 }
             }
             Err(diagnostics) => {
+                self.config.local_config_diagnostics = diagnostics.clone();
                 self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
             }
         }
@@ -158,6 +160,7 @@ impl ClientShellConfig {
             preferences_path: None,
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
+            local_config_diagnostics: Vec::new(),
             startup_onboarding: false,
         }
     }
@@ -180,6 +183,30 @@ impl ClientShellConfig {
 
     pub(crate) fn uses_endpoint_keybindings(&self) -> bool {
         self.keybinding_source == ClientShellKeybindingSource::Endpoint
+    }
+
+    pub(super) fn apply_keybinding_preference(
+        &mut self,
+        preference: crate::remote::RemoteKeybindings,
+        profile: Option<&str>,
+        commands: &[crate::protocol::ClientShellCommand],
+    ) -> Result<bool, String> {
+        let source = match preference {
+            crate::remote::RemoteKeybindings::Local => ClientShellKeybindingSource::Local,
+            crate::remote::RemoteKeybindings::Server => ClientShellKeybindingSource::Endpoint,
+        };
+        let keybinds = self.keybinds_for_snapshot(source, profile, commands)?;
+        let changed = self.keybinding_source != source;
+        self.keybinding_source = source;
+        self.keybinds = keybinds;
+        Ok(changed)
+    }
+
+    pub(super) fn reset_to_local_keybindings(&mut self) {
+        self.keybinding_source = ClientShellKeybindingSource::Local;
+        self.keybinds = self
+            .keybinds_for_snapshot(ClientShellKeybindingSource::Local, None, &[])
+            .expect("previously validated local keybindings");
     }
 
     pub(super) fn local_config_diagnostic(&self, diagnostics: &[String]) -> Option<String> {
@@ -205,11 +232,21 @@ impl ClientShellConfig {
         profile: Option<&str>,
         commands: &[crate::protocol::ClientShellCommand],
     ) -> Result<(), String> {
-        let mut keybinds = match self.keybinding_source {
+        self.keybinds = self.keybinds_for_snapshot(self.keybinding_source, profile, commands)?;
+        Ok(())
+    }
+
+    fn keybinds_for_snapshot(
+        &self,
+        source: ClientShellKeybindingSource,
+        profile: Option<&str>,
+        commands: &[crate::protocol::ClientShellCommand],
+    ) -> Result<LiveKeybindConfig, String> {
+        let mut keybinds = match source {
             ClientShellKeybindingSource::Endpoint => crate::config::keybindings_from_profile_toml(
                 profile.ok_or("endpoint did not publish its keybindings")?,
             )?,
-            ClientShellKeybindingSource::RemoteLocal => return Ok(()),
+            ClientShellKeybindingSource::RemoteLocal => return Ok(self.keybinds.clone()),
             ClientShellKeybindingSource::Local => {
                 let mut config = crate::config::Config {
                     keys: self.local_keys.clone(),
@@ -239,8 +276,6 @@ impl ClientShellConfig {
                             } else {
                                 crate::config::BindingConfig::Many(command.binding_labels.clone())
                             },
-                            // The client never executes this field; preserve the opaque endpoint ID
-                            // through the shared config collision resolver.
                             command: command.command_id.clone(),
                             action_type,
                             description: command.description.clone(),
@@ -255,7 +290,7 @@ impl ClientShellConfig {
                     .map_err(|diagnostics| diagnostics.join("; "))?
             }
         };
-        if self.keybinding_source == ClientShellKeybindingSource::Endpoint {
+        if source == ClientShellKeybindingSource::Endpoint {
             for command in commands {
                 let Ok(action) = command.action.try_into() else {
                     continue;
@@ -276,8 +311,7 @@ impl ClientShellConfig {
                     });
             }
         }
-        self.keybinds = keybinds;
-        Ok(())
+        Ok(keybinds)
     }
 
     pub(super) fn apply_live_config(
@@ -290,16 +324,16 @@ impl ClientShellConfig {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
-        if !invalid_section("keys")
-            && self.keybinding_source != ClientShellKeybindingSource::Endpoint
-        {
+        if !invalid_section("keys") {
             match config.live_keybinds_with_diagnostics() {
                 Ok((mut keybinds, keybind_diagnostics)) => {
                     self.local_keys = config.keys.clone();
-                    if self.keybinding_source == ClientShellKeybindingSource::RemoteLocal {
-                        keybinds.keybinds.custom_commands.clear();
+                    if self.keybinding_source != ClientShellKeybindingSource::Endpoint {
+                        if self.keybinding_source == ClientShellKeybindingSource::RemoteLocal {
+                            keybinds.keybinds.custom_commands.clear();
+                        }
+                        self.keybinds = keybinds;
                     }
-                    self.keybinds = keybinds;
                     diagnostics.extend(keybind_diagnostics);
                 }
                 Err(keybind_diagnostics) => diagnostics.extend(

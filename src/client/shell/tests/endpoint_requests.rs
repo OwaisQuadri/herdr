@@ -97,6 +97,7 @@ fn add_remote(state: &mut ClientShellState) -> ClientEndpointId {
         target: "dev@build.example".into(),
         session: "agents".into(),
         enabled: true,
+        keybindings: crate::remote::RemoteKeybindings::Local,
     };
     let remote = ClientEndpointId::Ssh(profile.id.clone());
     state.set_endpoint_catalog(&[profile]);
